@@ -275,6 +275,7 @@ def process_and_tier_messages(messages, body, model_name=None, is_llamaswap=True
 
     num_ctx, TRIGGER_CHARS, TARGET_ACTIVE_CHARS, SUMMARY_BUDGET_CHARS, CHUNK_LIMIT_CHARS, TOOL_TRUNCATE_LIMIT = calculate_dynamic_thresholds(body)
 
+    # 1. Basic Tool Sanitation
     messages = sanitize_tool_outputs(messages, TOOL_TRUNCATE_LIMIT)
     messages = deduplicate_tool_outputs(messages)
 
@@ -284,65 +285,58 @@ def process_and_tier_messages(messages, body, model_name=None, is_llamaswap=True
     if not conversation and not system_msgs:
         return messages
 
-    total_system_chars = sum(estimate_length(m) for m in system_msgs)
-    total_conv_chars = sum(estimate_length(m) for m in conversation)
-    total_chars = total_system_chars + total_conv_chars
+    # 2. STEP 1: Strip Previously Summarized History FIRST via Delta Guard
+    uncompacted_conversation = conversation
+    if LAST_COMPACTED_HASH:
+        for idx, msg in enumerate(conversation):
+            if get_message_hash(msg) == LAST_COMPACTED_HASH:
+                uncompacted_conversation = conversation[idx + 1:]
+                logger.info(f"[Delta Guard]: Found anchor at msg {idx}. Stripping {idx + 1} historical messages before audit.")
+                break
+
+    # 3. STEP 2: Calculate EFFECTIVE Footprint (Summary + Uncompacted Delta)
+    summary_len = len(LATEST_SUMMARY)
+    uncompacted_chars = sum(estimate_length(m) for m in uncompacted_conversation)
+    system_chars = sum(estimate_length(m) for m in system_msgs)
+
+    effective_total_chars = summary_len + uncompacted_chars + system_chars
+    effective_tokens = effective_total_chars // CHARS_PER_TOKEN
 
     logger.info(
-        f"[Context Audit]: Model Ctx: {num_ctx} tokens | Payload: {total_chars} chars (~{total_chars // CHARS_PER_TOKEN} tokens) | "
+        f"[Context Audit]: Model Ctx: {num_ctx} tokens | Effective Payload: {effective_total_chars} chars (~{effective_tokens} tokens) | "
         f"Float Trigger (80%): {TRIGGER_CHARS} chars | Active Target (45%): {TARGET_ACTIVE_CHARS} chars"
     )
 
-    if total_chars >= TRIGGER_CHARS:
-        logger.info(f"[Float Trigger Hit]: Footprint ({total_chars} chars) EXCEEDED 80% threshold ({TRIGGER_CHARS} chars). Compacting...")
+    # 4. STEP 3: Evaluate Trigger on EFFECTIVE Context Only
+    if effective_total_chars >= TRIGGER_CHARS:
+        logger.info(f"[Float Trigger Hit]: Effective footprint ({effective_total_chars} chars) EXCEEDED 80% threshold. Compacting...")
 
+        # Calculate Active Working Window against uncompacted messages
         active_budget = TARGET_ACTIVE_CHARS
-        active_idx = len(conversation)
+        active_idx = len(uncompacted_conversation)
 
-        for i in range(len(conversation) - 1, -1, -1):
-            msg_len = estimate_length(conversation[i])
+        for i in range(len(uncompacted_conversation) - 1, -1, -1):
+            msg_len = estimate_length(uncompacted_conversation[i])
             if active_budget - msg_len >= 0:
                 active_budget -= msg_len
                 active_idx = i
             else:
                 break
 
-        overflow_history = conversation[:active_idx]
-        recent_untouched = [dict(m) for m in conversation[active_idx:]]
+        overflow_delta = uncompacted_conversation[:active_idx]
+        recent_untouched = [dict(m) for m in uncompacted_conversation[active_idx:]]
 
-        logger.info(f"[Hysteresis Split]: {len(overflow_history)} overflow msg(s) | {len(recent_untouched)} active msg(s).")
-
-        # Delta slicing: identify only the NEW uncompacted overflow
-        uncompacted_delta = []
-        if LAST_COMPACTED_HASH:
-            anchor_found = False
-            for idx, msg in enumerate(overflow_history):
-                if get_message_hash(msg) == LAST_COMPACTED_HASH:
-                    # Everything up to idx was already summarized
-                    uncompacted_delta = overflow_history[idx + 1:]
-                    anchor_found = True
-                    logger.info(f"[Delta Guard]: Found anchor at msg {idx}. Stripping {idx + 1} previously summarized messages.")
-                    break
-
-            if not anchor_found:
-                # If UI history was altered or reset, treat all overflow as uncompacted
-                uncompacted_delta = overflow_history
-        else:
-            uncompacted_delta = overflow_history
-
-        if uncompacted_delta:
-            logger.info(f"[Delta Compactor]: Digesting {len(uncompacted_delta)} NEW overflow msg(s)...")
+        if overflow_delta:
+            logger.info(f"[Delta Compactor]: Digesting {len(overflow_delta)} NEW overflow message(s)...")
             compact_model = model_name or SUMMARY_MODEL
             LATEST_SUMMARY = run_chunked_compaction(
-                LATEST_SUMMARY, uncompacted_delta, compact_model, SUMMARY_BUDGET_CHARS, CHUNK_LIMIT_CHARS, is_llamaswap=is_llamaswap
+                LATEST_SUMMARY, overflow_delta, compact_model, SUMMARY_BUDGET_CHARS, CHUNK_LIMIT_CHARS, is_llamaswap=is_llamaswap
             )
-            # Update the anchor hash to the end of this newly compacted delta
-            LAST_COMPACTED_HASH = get_message_hash(overflow_history[-1])
-        else:
-            logger.info("[Delta Compactor]: Zero new overflow messages. Reusing existing LATEST_SUMMARY without calling LLM.")
+            # Update hash anchor to the end of the newly compacted delta
+            LAST_COMPACTED_HASH = get_message_hash(uncompacted_conversation[active_idx - 1])
     else:
-        logger.info("[Context Audit]: Payload within safe context boundaries. Bypassing compaction.")
-        recent_untouched = [dict(m) for m in conversation]
+        logger.info("[Context Audit]: Effective footprint within safe boundaries. Bypassing compaction.")
+        recent_untouched = [dict(m) for m in uncompacted_conversation]
 
     sys_content = system_msgs[0].get("content", "") if system_msgs else "You are a helpful AI assistant."
     structured_system_prompt = sys_content
