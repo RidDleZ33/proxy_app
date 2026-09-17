@@ -9,8 +9,7 @@ import logging
 import os
 import re
 import sys
-from collections import OrderedDict
-from multiprocessing import Manager
+import sqlite3
 from flask import Flask, jsonify, request, Response
 import requests
 
@@ -36,61 +35,39 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 LLAMASWAP_URL = os.getenv("LLAMASWAP_URL", "http://arceus:9931/v1")
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "qwen2.5:3b")
 
-# --- Multi-Chat Persistent Cache Configuration ---
-CACHE_DIR = "./chat_cache"
+# --- Multi-Chat Persistent Cache Configuration (SQLite) ---
+CACHE_DB = "/tmp/proxy_cache.db"
 MAX_CHATS = 50
 
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Shared state for Gunicorn multi-worker synchronization
-_manager = Manager()
-# Structure: SHARED_STATE["chats"] = { root_hash: {"summary": str, "last_anchor": str} }
-SHARED_STATE = _manager.dict({"chats": {}})
-
-
-def load_persistent_cache():
-    """Loads up to 50 most recently accessed chats from disk into shared memory at startup."""
-    loaded_chats = {}
-
-    files = [
-        os.path.join(CACHE_DIR, f)
-        for f in os.listdir(CACHE_DIR)
-        if f.endswith(".json")
-    ]
-
-    # Sort by last modified time (newest first)
-    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-
-    for file_path in files[:MAX_CHATS]:
-        try:
-            with open(file_path, "r") as f:
-                data = json.load(f)
-                root_hash = data.get("root_hash")
-                if root_hash:
-                    loaded_chats[root_hash] = {
-                        "summary": data.get("summary", ""),
-                        "last_anchor": data.get("last_anchor", None),
-                    }
-        except Exception as e:
-            logger.warning(f"[Smart Cache]: Error loading cache file {file_path}: {e}")
-
-    # Initialize Manager Dict
-    SHARED_STATE["chats"] = loaded_chats
-    logger.info(f"[Smart Cache]: Loaded {len(loaded_chats)} chat contexts from disk.")
+def _get_db_connection():
+    """Create a thread-safe SQLite connection with WAL mode for concurrent access."""
+    conn = sqlite3.connect(CACHE_DB, timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
 
-def save_chat_to_disk(root_hash, summary, last_anchor):
-    """Persists an updated chat state to disk."""
-    file_path = os.path.join(CACHE_DIR, f"{root_hash}.json")
+def _ensure_cache_table():
+    """Initialize the chat_cache table if it doesn't exist."""
+    conn = _get_db_connection()
     try:
-        with open(file_path, "w") as f:
-            json.dump(
-                {"root_hash": root_hash, "summary": summary, "last_anchor": last_anchor},
-                f,
-                indent=2,
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_cache (
+                root_hash TEXT PRIMARY KEY,
+                summary TEXT,
+                last_anchor TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-    except Exception as e:
-        logger.warning(f"[Smart Cache Error]: Failed to save chat {root_hash[:8]}...: {e}")
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Initialize cache table at proxy startup
+_ensure_cache_table()
 
 
 def get_chat_root_key(conversation_msgs):
@@ -104,53 +81,41 @@ def get_chat_root_key(conversation_msgs):
 
 
 def get_or_create_chat_state(root_hash):
-    """Retrieves thread state from shared RAM, loading from disk if evicted."""
-    chats = dict(SHARED_STATE["chats"])
-
-    if root_hash in chats:
-        return chats[root_hash]
-
-    # Check if file exists on disk (if evicted from memory previously)
-    file_path = os.path.join(CACHE_DIR, f"{root_hash}.json")
-    if os.path.exists(file_path):
-        try:
-            with open(file_path, "r") as f:
-                data = json.load(f)
-                state = {
-                    "summary": data.get("summary", ""),
-                    "last_anchor": data.get("last_anchor", None),
-                }
-                chats[root_hash] = state
-                SHARED_STATE["chats"] = chats
-                return state
-        except Exception:
-            pass
-
-    # Brand new chat thread
-    return {"summary": "", "last_anchor": None}
+    """Retrieves thread state from SQLite cache, returns default if not found."""
+    conn = _get_db_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT summary, last_anchor FROM chat_cache WHERE root_hash = ?",
+            (root_hash,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {"summary": row[0] or "", "last_anchor": row[1]}
+        return {"summary": "", "last_anchor": None}
+    finally:
+        conn.close()
 
 
 def update_chat_state(root_hash, summary, last_anchor):
-    """Updates state in shared memory and flushes to disk with LRU eviction."""
-    chats = dict(SHARED_STATE["chats"])
-
-    # LRU Eviction if memory store exceeds MAX_CHATS
-    if len(chats) >= MAX_CHATS and root_hash not in chats:
-        oldest_key = next(iter(chats))  # Evict oldest
-        del chats[oldest_key]
-        logger.info(f"[Smart Cache]: Evicted chat {oldest_key[:8]}... to make room.")
-
-    chats[root_hash] = {"summary": summary, "last_anchor": last_anchor}
-
-    # Write back to multiprocessing manager
-    SHARED_STATE["chats"] = chats
-
-    # Persist to disk
-    save_chat_to_disk(root_hash, summary, last_anchor)
-
-
-# Initialize cache at proxy startup
-load_persistent_cache()
+    """Updates chat state in SQLite with LRU eviction to maintain MAX_CHATS limit."""
+    conn = _get_db_connection()
+    try:
+        # Upsert the chat state
+        conn.execute(
+            "INSERT OR REPLACE INTO chat_cache (root_hash, summary, last_anchor, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (root_hash, summary, last_anchor)
+        )
+        
+        # LRU eviction: remove oldest chats beyond MAX_CHATS
+        conn.execute("""
+            DELETE FROM chat_cache WHERE root_hash NOT IN (
+                SELECT root_hash FROM chat_cache ORDER BY updated_at DESC LIMIT ?
+            )
+        """, (MAX_CHATS,))
+        
+        conn.commit()
+    finally:
+        conn.close()
 
 HEADER_SUMMARY = (
     "\n\n--- [SYSTEM NOTICE: PERSISTENT EXECUTION STATE SUMMARY] ---\n"
