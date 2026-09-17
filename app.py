@@ -378,9 +378,10 @@ def process_and_tier_messages(messages, body, model_name=None, is_llamaswap=True
     uncompacted_conversation = conversation
     if last_compacted_hash:
         for idx, msg in enumerate(conversation):
-            if get_message_hash(msg) == last_compacted_hash:
+            msg_hash = get_message_hash(msg)
+            if msg_hash == last_compacted_hash:
                 uncompacted_conversation = conversation[idx + 1:]
-                logger.info(f"[Delta Guard]: Found anchor at msg {idx}. Stripping {idx + 1} historical messages before audit.")
+                logger.info(f"[Delta Guard]: Stripping {idx + 1} historical messages up to anchor msg index {idx} ({msg_hash[:8]}...)")
                 break
 
     # 3. STEP 2: Calculate EFFECTIVE Footprint (Summary + Uncompacted Delta)
@@ -421,8 +422,10 @@ def process_and_tier_messages(messages, body, model_name=None, is_llamaswap=True
             updated_summary = run_chunked_compaction(
                 latest_summary, overflow_delta, compact_model, SUMMARY_BUDGET_CHARS, CHUNK_LIMIT_CHARS, is_llamaswap=is_llamaswap
             )
-            # Update hash anchor to the end of the newly compacted delta
-            new_anchor_hash = get_message_hash(uncompacted_conversation[active_idx - 1])
+            # Update hash anchor to the LAST message of the newly compacted delta
+            # This ensures subsequent turns strip the ENTIRE compacted block
+            new_anchor_hash = get_message_hash(overflow_delta[-1])
+            logger.info(f"[Anchor Update]: Set anchor to last overflow msg {len(overflow_delta)} ({new_anchor_hash[:8]}...)")
             # Persist updated state to shared cache + disk
             update_chat_state(root_key, updated_summary, new_anchor_hash)
             # Update local references
