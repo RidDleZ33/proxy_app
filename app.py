@@ -341,10 +341,10 @@ def process_and_tier_messages(messages, body, model_name=None, is_llamaswap=True
     sys_content = system_msgs[0].get("content", "") if system_msgs else "You are a helpful AI assistant."
     structured_system_prompt = sys_content
 
-    if LATEST_SUMMARY:
-        structured_system_prompt += f"{HEADER_SUMMARY}{LATEST_SUMMARY}\n"
+    if SHARED_STATE["summary"]:
+        structured_system_prompt += f"{HEADER_SUMMARY}{SHARED_STATE['summary']}\n"
 
-    if recent_untouched and LATEST_SUMMARY:
+    if recent_untouched and SHARED_STATE["summary"]:
         first_active_content = str(recent_untouched[0].get("content", ""))
         if HEADER_ACTIVE not in first_active_content:
             recent_untouched[0]["content"] = f"{HEADER_ACTIVE}\n{first_active_content}"
