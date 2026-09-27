@@ -1,6 +1,6 @@
 """
 app.py - Dynamic Multi-Pass Context Compaction Proxy
-Version: v2.3.2-universal
+Version: v2.4.0-universal
 """
 
 import hashlib
@@ -13,7 +13,7 @@ import uuid
 from flask import Flask, jsonify, request, Response
 import requests
 
-__VERSION__ = "v2.3.2-universal"
+__VERSION__ = "v2.4.0-universal"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,6 +64,32 @@ def _env_float(name, default):
         return default
 
 
+def _env_tool_mutation_mode(name, default="compact_only"):
+    """
+    How aggressively the proxy rewrites tool-result messages before forwarding.
+
+    always        — truncate + dedupe on every request (saves tokens, busts
+                    llama.cpp prefix cache whenever a new duplicate appears
+                    or a previously-short tool grows past the limit)
+    compact_only  — leave live tool results untouched until a compact fires;
+                    then rewrite overflow (summarizer input) and the active
+                    window. Cache already rebuilds on compact.
+    never         — never rewrite tool results in the forwarded chat payload.
+                    Summarizer input still clips individual tool bodies at
+                    2000 chars so a compact pass cannot blow its own context.
+    """
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        text = default
+    else:
+        text = raw.strip().lower()
+    if text in ("always", "on", "true", "1", "yes", "all"):
+        return "always"
+    if text in ("never", "off", "false", "0", "no", "none"):
+        return "never"
+    return "compact_only"
+
+
 def _strip_slash(url):
     return (url or "").rstrip("/")
 
@@ -101,6 +127,7 @@ ACTIVE_RATIO = _env_float("ACTIVE_RATIO", 0.45)
 SUMMARY_RATIO = _env_float("SUMMARY_RATIO", 0.12)
 CHUNK_RATIO = _env_float("CHUNK_RATIO", 0.25)
 TOOL_TRUNCATE_RATIO = _env_float("TOOL_TRUNCATE_RATIO", 0.05)
+TOOL_OUTPUT_MUTATIONS = _env_tool_mutation_mode("TOOL_OUTPUT_MUTATIONS", "compact_only")
 
 INJECT_SYSTEM_DIRECTIVE = _env_bool("INJECT_SYSTEM_DIRECTIVE", False)
 SYSTEM_DIRECTIVE = os.getenv("SYSTEM_DIRECTIVE", "").strip()
@@ -120,7 +147,8 @@ logger.info(
     f"[Config]: llamaswap={LLAMASWAP_URL} ollama={OLLAMA_URL} "
     f"summary_model={SUMMARY_MODEL or 'auto'} summary_backend={SUMMARY_BACKEND} "
     f"keep_alive={SUMMARY_KEEP_ALIVE} compact_timeout={COMPACT_TIMEOUT} "
-    f"cache_db={CACHE_DB} inject_directive={INJECT_SYSTEM_DIRECTIVE}"
+    f"cache_db={CACHE_DB} inject_directive={INJECT_SYSTEM_DIRECTIVE} "
+    f"tool_mutations={TOOL_OUTPUT_MUTATIONS}"
 )
 
 app = Flask(__name__)
@@ -684,8 +712,9 @@ def process_and_tier_messages(messages, body, chat_model=None, chat_backend="lla
     num_ctx, TRIGGER_CHARS, TARGET_ACTIVE_CHARS, SUMMARY_BUDGET_CHARS, CHUNK_LIMIT_CHARS, TOOL_TRUNCATE_LIMIT = calculate_dynamic_thresholds(body)
 
     messages = stamp_stable_hashes(messages)
-    messages = sanitize_tool_outputs(messages, TOOL_TRUNCATE_LIMIT)
-    messages = deduplicate_tool_outputs(messages)
+    if TOOL_OUTPUT_MUTATIONS == "always":
+        messages = sanitize_tool_outputs(messages, TOOL_TRUNCATE_LIMIT)
+        messages = deduplicate_tool_outputs(messages)
 
     system_msgs = [m for m in messages if m.get("role") == "system"]
     conversation = [m for m in messages if m.get("role") != "system"]
@@ -744,9 +773,13 @@ def process_and_tier_messages(messages, body, chat_model=None, chat_backend="lla
                 f"[Delta Compactor]: Digesting {len(overflow_delta)} NEW overflow message(s) "
                 f"via {compact_backend}/{compact_model}"
             )
+            compact_src = [dict(m) for m in overflow_delta]
+            if TOOL_OUTPUT_MUTATIONS != "never":
+                compact_src = sanitize_tool_outputs(compact_src, TOOL_TRUNCATE_LIMIT)
+                compact_src = deduplicate_tool_outputs(compact_src)
             updated_summary, ok = run_chunked_compaction(
                 latest_summary,
-                overflow_delta,
+                compact_src,
                 compact_model,
                 compact_backend,
                 SUMMARY_BUDGET_CHARS,
@@ -758,6 +791,13 @@ def process_and_tier_messages(messages, body, chat_model=None, chat_backend="lla
                 logger.info(f"[Anchor Update]: Set anchor to last overflow msg ({new_anchor_hash[:8]}...)")
                 update_chat_state(root_key, updated_summary, new_anchor_hash)
                 latest_summary = updated_summary
+                if TOOL_OUTPUT_MUTATIONS == "compact_only":
+                    recent_untouched = sanitize_tool_outputs(recent_untouched, TOOL_TRUNCATE_LIMIT)
+                    recent_untouched = deduplicate_tool_outputs(recent_untouched)
+                    logger.info(
+                        "[Tool Guard]: compact_only — truncated/deduped tool results in the "
+                        "post-compact active window only."
+                    )
             else:
                 logger.error(
                     "[Compactor]: Compact failed; leaving previous anchor in place so history is not stripped."
@@ -886,6 +926,8 @@ def get_version():
         "cache_db": CACHE_DB,
         "inject_directive": INJECT_SYSTEM_DIRECTIVE,
         "chars_per_token": CHARS_PER_TOKEN,
+        "tool_output_mutations": TOOL_OUTPUT_MUTATIONS,
+        "tool_truncate_ratio": TOOL_TRUNCATE_RATIO,
     })
 
 
